@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BaseBall Pro - Cloud Sync</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, collection, query, onSnapshot, updateDoc, arrayUnion } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firebase Config (Provided by environment)
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'baseball-score-app';
+
+        window.db = db;
+        window.auth = auth;
+        window.appId = appId;
+
+        // --- Auth Implementation (Rule 3) ---
+        const initAuth = async () => {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Auth Error:", error);
+            }
+        };
+        initAuth();
+
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                window.currentUser = user;
+                document.getElementById('user-status').innerText = `User: ${user.uid.substring(0,8)}...`;
+                // 認証後にデータをロード
+                loadRoster();
+                loadGameData();
+            }
+        });
+
+        // --- Firestore Operations ---
+        
+        // 選手名簿の保存
+        window.saveRosterToCloud = async (roster) => {
+            if (!window.currentUser) return;
+            const rosterRef = doc(db, 'artifacts', appId, 'users', window.currentUser.uid, 'settings', 'roster');
+            await setDoc(rosterRef, { players: roster });
+        };
+
+        // 選手名簿の読み込み
+        async function loadRoster() {
+            if (!window.currentUser) return;
+            const rosterRef = doc(db, 'artifacts', appId, 'users', window.currentUser.uid, 'settings', 'roster');
+            const snap = await getDoc(rosterRef);
+            if (snap.exists()) {
+                window.masterRoster = snap.data().players;
+                renderMasterRoster();
+            }
+        }
+
+        // 試合データの保存
+        window.saveGameToCloud = async (gameId, data) => {
+            if (!window.currentUser) return;
+            const gameRef = doc(db, 'artifacts', appId, 'users', window.currentUser.uid, 'games', gameId);
+            await setDoc(gameRef, data, { merge: true });
+        };
+
+        // 試合データの読み込み（リアルタイム同期）
+        function loadGameData() {
+            if (!window.currentUser) return;
+            const q = query(collection(db, 'artifacts', appId, 'users', window.currentUser.uid, 'games'));
+            onSnapshot(q, (snapshot) => {
+                const games = [];
+                snapshot.forEach(doc => games.push({ id: doc.id, ...doc.data() }));
+                window.allGames = games;
+                renderGameList();
+            }, (error) => console.error("Snapshot Error:", error));
+        }
+
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700&display=swap');
+        body { font-family: 'Noto+Sans+JP', sans-serif; background-color: #f8fafc; color: #1e293b; }
+        .card { background: white; border-radius: 20px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }
+        .tab-active { border-bottom: 4px solid #15803d; color: #15803d; }
+        .field-container { position: relative; width: 280px; height: 220px; margin: auto; background: #166534; clip-path: polygon(50% 100%, 0% 20%, 50% 0%, 100% 20%); border-radius: 50% 50% 0 0; }
+        .field-pos { position: absolute; width: 36px; height: 36px; background: rgba(255,255,255,0.2); border: 1px solid white; color: white; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; cursor: pointer; transform: translate(-50%, -50%); z-index: 10; }
+        .field-pos.selected { background: #fbbf24; color: #000; font-weight: bold; border-color: #000; }
+        .diamond-mini { position: relative; width: 130px; height: 130px; margin: auto; transform: rotate(45deg); border: 2px solid #064e3b; }
+        .base { position: absolute; width: 20px; height: 20px; background: #e2e8f0; border: 1px solid #94a3b8; transform: translate(-50%, -50%); cursor: pointer; }
+        .base.occupied { background: #ef4444; border-color: #fca5a5; box-shadow: 0 0 10px #f87171; }
+        .base-label { position: absolute; transform: rotate(-45deg); font-size: 10px; white-space: nowrap; width: 90px; color: #fff; pointer-events: none; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+    </style>
+</head>
+<body class="p-2 md:p-6 pb-24">
+
+    <div id="app" class="max-w-6xl mx-auto">
+        <!-- Header -->
+        <header class="flex justify-between items-center mb-6 bg-slate-900 text-white p-5 rounded-3xl shadow-2xl">
+            <h1 class="text-2xl font-black tracking-tight">BASEBALL PRO <span class="text-green-400">CLOUD</span></h1>
+            <div id="user-status" class="text-[10px] bg-slate-800 px-3 py-1 rounded-full text-slate-400 italic">Authenticating...</div>
+        </header>
+
+        <!-- Navigation -->
+        <nav class="flex gap-6 mb-6 border-b overflow-x-auto no-scrollbar">
+            <button onclick="switchTab('roster')" class="nav-tab p-3 font-bold tab-active">👥 チーム名簿</button>
+            <button onclick="switchTab('lineup')" class="nav-tab p-3 font-bold text-slate-500">📋 打順・守備</button>
+            <button onclick="switchTab('score')" class="nav-tab p-3 font-bold text-slate-500">📝 スコア記録</button>
+        </nav>
+
+        <!-- Tab: Roster (Cloud Synced) -->
+        <section id="tab-roster" class="tab-content">
+            <div class="card p-6">
+                <div class="flex justify-between items-center mb-6">
+                    <div>
+                        <h2 class="text-xl font-bold">選手名簿</h2>
+                        <p class="text-xs text-slate-400">クラウドに自動保存されます</p>
+                    </div>
+                    <button onclick="addPlayer()" class="bg-green-600 text-white px-5 py-2 rounded-xl text-sm font-bold shadow-lg hover:bg-green-700 transition">+ 選手追加</button>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr class="text-slate-400 border-b">
+                                <th class="p-3 text-left">#</th>
+                                <th class="p-3 text-left">名前</th>
+                                <th class="p-3 text-left">利き腕</th>
+                                <th class="p-3 text-right">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="roster-list"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- Tab: Lineup -->
+        <section id="tab-lineup" class="tab-content hidden">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div class="card p-6 border-t-4 border-green-600">
+                    <h3 class="font-bold mb-4 flex justify-between">自チーム
+                        <button onclick="syncLineup('home')" class="text-[10px] bg-slate-100 px-2 py-1 rounded">保存</button>
+                    </h3>
+                    <div id="lineup-home" class="space-y-2"></div>
+                </div>
+                <div class="card p-6 border-t-4 border-red-600">
+                    <h3 class="font-bold mb-4 flex justify-between">相手チーム
+                        <button onclick="syncLineup('away')" class="text-[10px] bg-slate-100 px-2 py-1 rounded">保存</button>
+                    </h3>
+                    <div id="lineup-away" class="space-y-2"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Tab: Score -->
+        <section id="tab-score" class="tab-content hidden">
+            <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                <!-- Field & Inning -->
+                <div class="lg:col-span-4 space-y-4">
+                    <div class="card p-6 bg-slate-900 text-white shadow-2xl overflow-hidden relative">
+                        <div class="diamond-mini mb-10">
+                            <div class="base" style="bottom: 0; right: 0; background: #fff;"></div>
+                            <div id="b-1" class="base" style="top: 0; right: 0;" onclick="toggleBase(0)">
+                                <div class="base-label text-right" style="top: -25px; right: -40px;" id="label-1">---</div>
+                            </div>
+                            <div id="b-2" class="base" style="top: 0; left: 0;" onclick="toggleBase(1)">
+                                <div class="base-label text-center" style="top: -35px; left: -35px;" id="label-2">---</div>
+                            </div>
+                            <div id="b-3" class="base" style="bottom: 0; left: 0;" onclick="toggleBase(2)">
+                                <div class="base-label text-left" style="bottom: -25px; left: -40px;" id="label-3">---</div>
+                            </div>
+                        </div>
+                        <div class="flex justify-between border-t border-slate-800 pt-4 font-black">
+                            <div class="text-orange-500">OUT <span id="out-count">○○○</span></div>
+                            <div id="inning-display" class="text-green-400">1表</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Input Area -->
+                <div class="lg:col-span-8 card p-6">
+                    <div class="mb-6 flex justify-between items-center border-b pb-4">
+                        <div>
+                            <p class="text-[10px] font-bold text-slate-400 uppercase">Now Batting</p>
+                            <h2 class="text-3xl font-black italic text-slate-800"><span id="bat-no">1</span>. <span id="bat-name">----</span></h2>
+                        </div>
+                        <div class="text-right">
+                            <span id="bat-pos" class="bg-slate-100 px-3 py-1 rounded-full text-xs font-bold">---</span>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+                        <div class="grid grid-cols-3 gap-2">
+                            <button onclick="setRes('単打')" class="res-btn bg-yellow-400 p-3 rounded-xl font-bold text-sm shadow-sm">単打</button>
+                            <button onclick="setRes('二塁打')" class="res-btn bg-yellow-400 p-3 rounded-xl font-bold text-sm shadow-sm">2BH</button>
+                            <button onclick="setRes('三塁打')" class="res-btn bg-yellow-400 p-3 rounded-xl font-bold text-sm shadow-sm">3BH</button>
+                            <button onclick="setRes('本塁打')" class="res-btn bg-red-600 text-white p-3 rounded-xl font-bold text-sm shadow-sm">HR</button>
+                            <button onclick="setRes('三振')" class="res-btn bg-slate-200 p-3 rounded-xl font-bold text-sm shadow-sm">三振</button>
+                            <button onclick="setRes('凡退')" class="res-btn bg-slate-200 p-3 rounded-xl font-bold text-sm shadow-sm">凡退</button>
+                            <button onclick="setRes('四死球')" class="res-btn bg-blue-100 p-3 rounded-xl font-bold text-sm shadow-sm">四球</button>
+                            <button onclick="setRes('犠打')" class="res-btn bg-orange-100 p-3 rounded-xl font-bold text-sm shadow-sm">犠打</button>
+                            <button onclick="setRes('犠飛')" class="res-btn bg-orange-100 p-3 rounded-xl font-bold text-sm shadow-sm">犠飛</button>
+                        </div>
+                        <div class="flex flex-col items-center">
+                            <div class="field-container mb-4">
+                                <div class="field-pos" style="top: 15%; left: 50%;" data-p="中" onclick="setDir(this)">中</div>
+                                <div class="field-pos" style="top: 30%; left: 20%;" data-p="左" onclick="setDir(this)">左</div>
+                                <div class="field-pos" style="top: 30%; left: 80%;" data-p="右" onclick="setDir(this)">右</div>
+                                <div class="field-pos" style="top: 55%; left: 35%;" data-p="遊" onclick="setDir(this)">遊</div>
+                                <div class="field-pos" style="top: 55%; left: 65%;" data-p="二" onclick="setDir(this)">二</div>
+                                <div class="field-pos" style="top: 80%; left: 25%;" data-p="三" onclick="setDir(this)">三</div>
+                                <div class="field-pos" style="top: 80%; left: 75%;" data-p="一" onclick="setDir(this)">一</div>
+                                <div class="field-pos" style="top: 82%; left: 50%;" data-p="投" onclick="setDir(this)">投</div>
+                                <div class="field-pos" style="top: 95%; left: 50%;" data-p="捕" onclick="setDir(this)">捕</div>
+                            </div>
+                            <button onclick="recordAtBat()" class="w-full bg-green-800 text-white py-4 rounded-2xl font-black shadow-xl hover:scale-[1.02] transition">記録して次へ</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <script>
+        // --- State Management ---
+        window.masterRoster = [];
+        let state = {
+            currentTab: 'roster',
+            lineups: { 
+                home: Array.from({length: 9}, (_, i) => ({ name: "未設定", pos: "投" })),
+                away: Array.from({length: 9}, (_, i) => ({ name: `相手${i+1}`, pos: "投" }))
+            },
+            bases: [null, null, null],
+            inning: { num: 1, side: 'top' },
+            activeBatterIdx: { home: 0, away: 0 },
+            currentAction: { res: '', dir: '' }
+        };
+
+        const POS = ["投", "捕", "一", "二", "三", "遊", "左", "中", "右", "指"];
+
+        // --- UI Logic ---
+        function switchTab(id) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+            document.getElementById('tab-' + id).classList.remove('hidden');
+            document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('tab-active'));
+            event.currentTarget.classList.add('tab-active');
+            state.currentTab = id;
+            if (id === 'lineup') renderLineups();
+            if (id === 'score') updateBatterUI();
+        }
+
+        // --- Roster Logic ---
+        function addPlayer() {
+            const name = prompt("選手名:");
+            if (!name) return;
+            const no = prompt("背番号:");
+            window.masterRoster.push({ name, no: no || "0", hand: "右/右", id: Date.now() });
+            renderMasterRoster();
+            window.saveRosterToCloud(window.masterRoster);
+        }
+
+        function renderMasterRoster() {
+            const list = document.getElementById('roster-list');
+            list.innerHTML = window.masterRoster.map((p, i) => `
+                <tr class="border-b hover:bg-slate-50">
+                    <td class="p-3 font-bold">#${p.no}</td>
+                    <td class="p-3 font-bold">${p.name}</td>
+                    <td class="p-3 text-xs text-slate-400">${p.hand}</td>
+                    <td class="p-3 text-right">
+                        <button onclick="deletePlayer(${i})" class="text-red-400 hover:text-red-600">削除</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        function deletePlayer(i) {
+            if(confirm("削除しますか？")) {
+                window.masterRoster.splice(i, 1);
+                renderMasterRoster();
+                window.saveRosterToCloud(window.masterRoster);
+            }
+        }
+
+        // --- Lineup Logic ---
+        function renderLineups() {
+            ['home', 'away'].forEach(team => {
+                const container = document.getElementById(`lineup-${team}`);
+                container.innerHTML = state.lineups[team].map((p, i) => `
+                    <div class="flex gap-2 items-center p-2 bg-slate-50 rounded-lg">
+                        <span class="w-5 text-[10px] font-bold text-slate-400">${i+1}</span>
+                        <select onchange="updateLineup('${team}', ${i}, 'name', this.value)" class="flex-1 text-sm bg-transparent font-bold">
+                            <option value="未設定">-- 選択 --</option>
+                            ${team === 'home' ? window.masterRoster.map(m => `<option value="${m.name}" ${p.name===m.name?'selected':''}>${m.name}</option>`).join('') : `<option selected>${p.name}</option>`}
+                            ${team === 'away' ? '<option value="CUSTOM">直接入力</option>' : ''}
+                        </select>
+                        <select onchange="updateLineup('${team}', ${i}, 'pos', this.value)" class="w-12 text-[10px] bg-white border rounded">
+                            ${POS.map(o => `<option value="${o}" ${p.pos===o?'selected':''}>${o}</option>`).join('')}
+                        </select>
+                    </div>
+                `).join('');
+            });
+        }
+
+        function updateLineup(team, idx, key, val) {
+            if (val === 'CUSTOM') {
+                const n = prompt("名前:");
+                if(n) state.lineups[team][idx].name = n;
+            } else {
+                state.lineups[team][idx][key] = val;
+            }
+            renderLineups();
+        }
+
+        async function syncLineup(team) {
+            await window.saveGameToCloud('current_game', { [`lineup_${team}`]: state.lineups[team] });
+            alert("クラウドに保存しました");
+        }
+
+        // --- Score Logic ---
+        function updateBatterUI() {
+            const team = state.inning.side === 'top' ? 'home' : 'away';
+            const idx = state.activeBatterIdx[team] % state.lineups[team].length;
+            const b = state.lineups[team][idx];
+            document.getElementById('bat-no').innerText = idx + 1;
+            document.getElementById('bat-name').innerText = b.name;
+            document.getElementById('bat-pos').innerText = b.pos;
+            document.getElementById('inning-display').innerText = `${state.inning.num}${state.inning.side==='top'?'表':'裏'}`;
+            renderBases();
+        }
+
+        function toggleBase(idx) {
+            if (state.bases[idx]) {
+                state.bases[idx] = null;
+            } else {
+                state.bases[idx] = "Runner";
+            }
+            renderBases();
+        }
+
+        function renderBases() {
+            for(let i=0; i<3; i++) {
+                const el = document.getElementById(`b-${i+1}`);
+                const label = document.getElementById(`label-${i+1}`);
+                if (state.bases[i]) {
+                    el.classList.add('occupied');
+                    label.innerText = state.bases[i] === "Runner" ? "走者あり" : state.bases[i];
+                } else {
+                    el.classList.remove('occupied');
+                    label.innerText = "---";
+                }
+            }
+        }
+
+        function setRes(res) {
+            state.currentAction.res = res;
+            document.querySelectorAll('.res-btn').forEach(b => b.classList.remove('ring-4', 'ring-green-500'));
+            event.currentTarget.classList.add('ring-4', 'ring-green-500');
+        }
+
+        function setDir(el) {
+            state.currentAction.dir = el.dataset.p;
+            document.querySelectorAll('.field-pos').forEach(p => p.classList.remove('selected'));
+            el.classList.add('selected');
+        }
+
+        async function recordAtBat() {
+            if (!state.currentAction.res) return alert("結果を選択してください");
+            
+            const team = state.inning.side === 'top' ? 'home' : 'away';
+            const batter = state.lineups[team][state.activeBatterIdx[team] % state.lineups[team].length];
+            
+            const logEntry = {
+                inning: `${state.inning.num}${state.inning.side==='top'?'表':'裏'}`,
+                name: batter.name,
+                result: state.currentAction.res,
+                dir: state.currentAction.dir,
+                timestamp: Date.now()
+            };
+
+            // クラウドへ追加保存
+            await window.saveGameToCloud('current_game', {
+                logs: arrayUnion(logEntry),
+                activeIdx: state.activeBatterIdx
+            });
+
+            // 簡易的な進塁
+            if (['単打', '四死球'].includes(state.currentAction.res)) state.bases[0] = batter.name;
+            if (state.currentAction.res === '二塁打') state.bases[1] = batter.name;
+
+            state.activeBatterIdx[team]++;
+            state.currentAction = { res: '', dir: '' };
+            
+            updateBatterUI();
+            document.querySelectorAll('.res-btn').forEach(b => b.classList.remove('ring-4', 'ring-green-500'));
+            document.querySelectorAll('.field-pos').forEach(p => p.classList.remove('selected'));
+        }
+
+        // ダミー
+        function renderGameList() {}
+    </script>
+</body>
+</html>
